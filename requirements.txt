@@ -1,0 +1,9 @@
+pdfplumber
+python-docx
+spacy>=3.8.14
+sentence-transformers
+scikit-learn
+pandas
+numpy
+rapidfuzz
+streamlit
