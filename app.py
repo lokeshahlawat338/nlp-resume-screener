@@ -1,8 +1,16 @@
 """
-NLP Resume Screener — Streamlit UI.
+NLP Resume Screener — Streamlit UI (Pass 3: full layout matching the
+original project's design — sidebar, multi-resume upload, leaderboard,
+detailed per-resume cards, improvement suggestions, downloadable report —
+plus our own skill-gap bar chart enhancement).
 """
 
+import os
+import json
+from datetime import datetime
+
 import streamlit as st
+import pandas as pd
 import matplotlib.pyplot as plt
 
 from src.extractor import extract_pdf_text
@@ -11,15 +19,14 @@ from src.section_parser import parse_sections, locate_skills_in_sections
 from src.ner_extractor import SkillExtractor
 from src.embedding import SemanticMatcher
 from src.tfidf_matcher import TFIDFMatcher
+from src.ranking_engine import rank_resumes
 from src.ats_scorer import compute_ats_score, ats_grade
 
 
-st.set_page_config(page_title="NLP Resume Screener", page_icon="📄", layout="wide")
+# ── Cached pipeline components ─────────────────────────────────────────────
 
-
-# Cache heavy objects so they load ONCE per session, not on every interaction.
 @st.cache_resource
-def load_pipeline_components():
+def load_models():
     return {
         "preprocessor": TextPreprocessor(),
         "skill_extractor": SkillExtractor(),
@@ -28,138 +35,463 @@ def load_pipeline_components():
     }
 
 
-def screen_resume(job_description: str, resume_text: str, components: dict) -> dict:
-    pre = components["preprocessor"]
-    skill_extractor = components["skill_extractor"]
+# ── Helper / explainability functions ──────────────────────────────────────
 
-    sections = parse_sections(resume_text)
-    detected_sections = list(sections.keys())
-
-    jd_skills = skill_extractor.extract_skills(job_description)
-    resume_skills = skill_extractor.extract_skills(resume_text)
-
-    skill_locations_raw = locate_skills_in_sections(resume_skills, sections)
-    skill_locations = {
-        skill: (locs[0] if locs else "")
-        for skill, locs in skill_locations_raw.items()
-    }
-
-    sbert_score = components["sbert_matcher"].similarity(
-        pre.clean_only(job_description), pre.clean_only(resume_text)
-    )
-    tfidf_score = components["tfidf_matcher"].similarity(
-        pre.full(job_description), pre.full(resume_text)
-    )
-
-    return compute_ats_score(
-        jd_skills=jd_skills,
-        resume_skills=resume_skills,
-        sbert_score=sbert_score,
-        tfidf_score=tfidf_score,
-        skill_locations=skill_locations,
-        detected_sections=detected_sections,
-    )
-
-
-# ── UI ────────────────────────────────────────────────────────────────────
-
-st.title("📄 NLP Resume Screener")
-st.caption("AI-powered resume screening using SBERT semantic matching + ATS scoring")
-
-components = load_pipeline_components()
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("Job Description")
-    job_description = st.text_area(
-        "Paste the job description here",
-        height=250,
-        placeholder="e.g. We are looking for a Backend Engineer with experience in Python, Django, AWS...",
-    )
-
-with col2:
-    st.subheader("Resume")
-    uploaded_file = st.file_uploader("Upload a resume (PDF)", type=["pdf"])
-
-analyze_clicked = st.button("🔍 Analyze Resume", type="primary", use_container_width=True)
-
-if analyze_clicked:
-    if not job_description.strip():
-        st.warning("Please paste a job description.")
-    elif not uploaded_file:
-        st.warning("Please upload a resume PDF.")
+def match_interpretation(score: float) -> str:
+    if score >= 0.55:
+        return (
+            "✅ Strong semantic match. Candidate covers most required "
+            "skills and context. Recommended for shortlisting."
+        )
+    elif score >= 0.35:
+        return (
+            "⚠️ Partial match. Relevant experience present but key "
+            "skills are missing. Review breakdown before deciding."
+        )
     else:
-        with st.spinner("Analyzing resume..."):
-            resume_text = extract_pdf_text(uploaded_file)
-            result = screen_resume(job_description, resume_text, components)
-            grade, label, color = ats_grade(result["total"])
+        return (
+            "❌ Weak match. Resume does not align well with this JD. "
+            "Significant skill gaps detected."
+        )
 
-        st.divider()
 
-        # ── Score header ──
-        score_col, grade_col = st.columns([2, 1])
-        with score_col:
-            st.metric("ATS Score", f"{result['total']}/100")
-            st.progress(result["total"] / 100)
-        with grade_col:
-            st.markdown(f"### Grade: **{grade}**")
-            st.markdown(f"*{label}*")
+def improvement_suggestions(missing: list) -> list:
+    suggestions = []
+    for skill in missing:
+        sl = skill.lower()
+        if any(x in sl for x in ["docker", "kubernetes", "k8s"]):
+            suggestions.append(
+                f"**{skill}** — Add a project where you containerised an app. "
+                f"Even a personal project using Docker Compose counts."
+            )
+        elif any(x in sl for x in ["aws", "gcp", "azure", "cloud"]):
+            suggestions.append(
+                f"**{skill}** — Get a free-tier account and deploy a project. "
+                f"Mention the specific service used (EC2, S3, Lambda, etc.)."
+            )
+        elif any(x in sl for x in ["pytorch", "tensorflow", "keras"]):
+            suggestions.append(
+                f"**{skill}** — Build a small ML project and mention the "
+                f"framework explicitly in your resume."
+            )
+        elif any(x in sl for x in ["sql", "postgresql", "mysql", "mongodb"]):
+            suggestions.append(
+                f"**{skill}** — If you've used any database in a project, "
+                f"name it explicitly. Recruiters scan for database keywords."
+            )
+        elif any(x in sl for x in ["react", "node", "javascript", "typescript"]):
+            suggestions.append(
+                f"**{skill}** — Add to Skills section and mention a project "
+                f"where you used it, even briefly."
+            )
+        elif any(x in sl for x in ["ci/cd", "github actions", "jenkins"]):
+            suggestions.append(
+                f"**{skill}** — Set up a basic GitHub Actions workflow on "
+                f"one of your repos. 30 minutes of work, strong keyword signal."
+            )
+        elif any(x in sl for x in ["machine learning", "deep learning", "nlp"]):
+            suggestions.append(
+                f"**{skill}** — Describe your ML projects with specifics: "
+                f"model type, dataset, metric. Vague descriptions don't register."
+            )
+        else:
+            suggestions.append(
+                f"**{skill}** — If you have any experience (coursework, "
+                f"projects, self-study), add it explicitly to Skills or Projects."
+            )
+    return suggestions
 
-        st.divider()
 
-        # ── Factor breakdown ──
-        st.subheader("Score Breakdown")
-        b1, b2, b3, b4, b5 = st.columns(5)
-        b1.metric("Skill Match", f"{result['skill_match']}/40")
-        b2.metric("Semantic", f"{result['semantic_relevance']}/25")
-        b3.metric("Experience", f"{result['experience_relevance']}/20")
-        b4.metric("Structure", f"{result['resume_structure']}/10")
-        b5.metric("Keywords", f"{result['keyword_coverage']}/5")
+def section_tips(locations: dict, matched: list) -> list:
+    tips = []
+    only_in_skills = [s for s in matched if locations.get(s, "") == "Skills"]
+    in_experience = [
+        s for s in matched
+        if locations.get(s, "") in ["Experience", "Internship", "Projects"]
+    ]
 
-        st.divider()
+    if only_in_skills:
+        skill_list = ", ".join(only_in_skills[:4])
+        tips.append(
+            f"⚠️ **{skill_list}** appear only in your Skills section. "
+            f"Mentioning them with context in Experience or Projects "
+            f"significantly strengthens your resume — recruiters trust "
+            f"demonstrated usage over listed skills."
+        )
+    if len(in_experience) == 0 and matched:
+        tips.append(
+            "⚠️ None of your matched skills appear in Experience. "
+            "Try weaving key technologies into bullet points "
+            "(e.g. 'Built REST API using FastAPI and PostgreSQL')."
+        )
+    if not tips:
+        tips.append(
+            "✅ Skills are well-distributed across sections. "
+            "Good structure for both ATS and human reviewers."
+        )
+    return tips
 
-        # ── Matched / Missing skills: visual chart + text ──
-        breakdown = result["breakdown"]
-        matched = breakdown["matched_skills"]
-        missing = breakdown["missing_skills"]
 
-        st.subheader("📊 Skill Gap Analysis")
+def generate_report(resume_name, jd_skills, ats, score, matched, missing, locations, suggestions, tips) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    grade, label, _ = ats_grade(ats["total"])
+    lines = [
+        "=" * 60,
+        "NLP RESUME SCREENER — ATS ANALYSIS REPORT",
+        f"Generated: {now}",
+        "=" * 60,
+        "",
+        f"Resume:       {resume_name}",
+        f"ATS Score:    {ats['total']}/100  Grade: {grade} — {label}",
+        f"Match Score:  {int(score * 100)}%",
+        "",
+        "SCORE BREAKDOWN",
+        "-" * 40,
+        f"  Skill Match:           {ats['skill_match']}/40",
+        f"  Semantic Relevance:    {ats['semantic_relevance']}/25",
+        f"  Experience Relevance:  {ats['experience_relevance']}/20",
+        f"  Resume Structure:      {ats['resume_structure']}/10",
+        f"  Keyword Coverage:      {ats['keyword_coverage']}/5",
+        "",
+        "JD SKILLS DETECTED",
+        "-" * 40,
+        ", ".join(jd_skills) if jd_skills else "None",
+        "",
+        f"MATCHED SKILLS ({len(matched)}/{len(jd_skills) if jd_skills else 0})",
+        "-" * 40,
+    ]
+    for skill in matched:
+        section = locations.get(skill, "Unknown")
+        lines.append(f"  [OK] {skill:25s} [Found in: {section}]")
 
-        if matched or missing:
-            skill_labels = matched + missing
-            skill_colors = ["#2ecc71"] * len(matched) + ["#e74c3c"] * len(missing)
-            skill_values = [1] * len(skill_labels)  # uniform bar length; color is the signal
+    lines += ["", f"MISSING SKILLS ({len(missing)}/{len(jd_skills) if jd_skills else 0})", "-" * 40]
+    for skill in missing:
+        lines.append(f"  [MISSING] {skill}")
 
-            fig, ax = plt.subplots(figsize=(8, max(2, len(skill_labels) * 0.4)))
-            bars = ax.barh(skill_labels, skill_values, color=skill_colors)
-            ax.set_xlim(0, 1.3)
-            ax.set_xticks([])
-            ax.invert_yaxis()  # first skill at top
-            ax.spines[["top", "right", "bottom"]].set_visible(False)
+    lines += ["", "IMPROVEMENT SUGGESTIONS", "-" * 40]
+    for i, s in enumerate(suggestions, 1):
+        lines.append(f"{i}. {s.replace('**', '')}")
 
-            for bar, label in zip(bars, ["Matched"] * len(matched) + ["Missing"] * len(missing)):
-                ax.text(
-                    bar.get_width() + 0.05, bar.get_y() + bar.get_height() / 2,
-                    label, va="center", fontsize=9, color="#555"
+    lines += ["", "SECTION TIPS", "-" * 40]
+    for tip in tips:
+        clean = tip.replace("**", "").replace("⚠️", "[!]").replace("✅", "[OK]")
+        lines.append(f"• {clean}")
+
+    lines += ["", "=" * 60, "End of Report", "=" * 60]
+    return "\n".join(lines)
+
+
+def render_skill_gap_chart(matched: list, missing: list):
+    """Our enhancement: visual bar chart of matched vs missing skills."""
+    if not (matched or missing):
+        st.write("No skills detected to compare.")
+        return
+    skill_labels = matched + missing
+    skill_colors = ["#2ecc71"] * len(matched) + ["#e74c3c"] * len(missing)
+    skill_values = [1] * len(skill_labels)
+
+    fig, ax = plt.subplots(figsize=(7, max(1.5, len(skill_labels) * 0.35)))
+    bars = ax.barh(skill_labels, skill_values, color=skill_colors)
+    ax.set_xlim(0, 1.3)
+    ax.set_xticks([])
+    ax.invert_yaxis()
+    ax.spines[["top", "right", "bottom"]].set_visible(False)
+    for bar, lbl in zip(bars, ["Matched"] * len(matched) + ["Missing"] * len(missing)):
+        ax.text(bar.get_width() + 0.05, bar.get_y() + bar.get_height() / 2,
+                lbl, va="center", fontsize=8, color="#555")
+    st.pyplot(fig, use_container_width=True)
+
+
+# ── Page config ─────────────────────────────────────────────────────────────
+st.set_page_config(page_title="NLP Resume Screener", page_icon="📄", layout="wide")
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 🤖 About This Tool")
+    st.markdown(
+        "Helps **recruiters and job seekers** analyse how well a resume "
+        "matches a job description using NLP.\n\n"
+        "Combines **Sentence-BERT** (semantic understanding) with "
+        "**TF-IDF** (keyword matching) into a multi-factor ATS score."
+    )
+    st.divider()
+    st.markdown("## ⚙️ How It Works")
+    st.markdown(
+        "1. **Upload** resume PDF(s)\n"
+        "2. **Paste** the job description\n"
+        "3. **Click** Analyse Resumes\n\n"
+        "The app extracts skills, parses resume sections, computes "
+        "semantic similarity, and produces an explainable ATS score."
+    )
+    st.divider()
+    st.markdown("## 📊 ATS Score Breakdown")
+    st.markdown(
+        "| Factor | Weight |\n"
+        "|--------|--------|\n"
+        "| Skill Match | 40 pts |\n"
+        "| Semantic Relevance | 25 pts |\n"
+        "| Experience Relevance | 20 pts |\n"
+        "| Resume Structure | 10 pts |\n"
+        "| Keyword Coverage | 5 pts |"
+    )
+    st.divider()
+    st.markdown("## 🏷️ Grade Guide")
+    st.markdown(
+        "🟢 **A** — 80+ Excellent Match\n\n"
+        "🔵 **B** — 65–79 Good Match\n\n"
+        "🟡 **C** — 50–64 Moderate Match\n\n"
+        "🔴 **D** — 35–49 Weak Match\n\n"
+        "🔴 **F** — Below 35 Poor Match"
+    )
+    st.divider()
+    st.markdown("## 📈 Model Benchmark")
+    eval_path = os.path.join("evaluation", "results", "eval_results.json")
+    if os.path.exists(eval_path):
+        with open(eval_path, "r") as f:
+            eval_data = json.load(f)
+        avg = next(r for r in eval_data if r["JD"] == "AVERAGE")
+        c1, c2 = st.columns(2)
+        c1.metric(
+            "SBERT P@1", f"{float(avg['SBERT P@1']):.0%}",
+            f"+{(float(avg['SBERT P@1']) - float(avg['TFIDF P@1'])):.0%} vs TF-IDF"
+        )
+        c2.metric("TF-IDF P@1", f"{float(avg['TFIDF P@1']):.0%}")
+    else:
+        st.caption("Run `python -m evaluation.evaluate` to populate this.")
+
+
+# ── Main header ──────────────────────────────────────────────────────────────
+st.title("📄 NLP Resume Screener")
+st.markdown(
+    "#### Rank candidates and improve resumes using semantic AI — "
+    "not just keyword matching."
+)
+st.info(
+    "💡 **Recruiters:** Upload multiple resumes to rank and score candidates. "
+    "**Job seekers:** Upload your resume to get an ATS score, skill gap "
+    "analysis, and specific improvement tips.",
+    icon="💡"
+)
+st.divider()
+
+components = load_models()
+
+# ── Inputs ───────────────────────────────────────────────────────────────────
+col_left, col_right = st.columns([1, 1])
+
+with col_left:
+    st.markdown("### 📁 Upload Resume(s)")
+    st.caption("PDF only. Upload one (job seeker) or many (recruiter).")
+    uploaded_files = st.file_uploader(
+        "Resumes", type=["pdf"], accept_multiple_files=True,
+        label_visibility="collapsed"
+    )
+    if uploaded_files:
+        st.success(f"✅ {len(uploaded_files)} resume(s) ready.")
+
+with col_right:
+    st.markdown("### 📋 Job Description")
+    st.caption("Paste the full JD including required and nice-to-have skills.")
+    job_description = st.text_area(
+        "JD", height=220,
+        placeholder="e.g. Looking for a Python backend engineer with FastAPI, PostgreSQL, Docker and AWS...",
+        label_visibility="collapsed"
+    )
+
+st.divider()
+run_col, _ = st.columns([1, 3])
+with run_col:
+    run_button = st.button("🔍 Analyse Resumes", type="primary", use_container_width=True)
+
+
+# ── Processing ───────────────────────────────────────────────────────────────
+if run_button:
+    if not uploaded_files:
+        st.warning("⚠️ Please upload at least one resume PDF.")
+    elif not job_description.strip():
+        st.warning("⚠️ Please paste a job description.")
+    else:
+        pre = components["preprocessor"]
+        skill_extractor = components["skill_extractor"]
+        sbert_matcher = components["sbert_matcher"]
+        tfidf_matcher = components["tfidf_matcher"]
+
+        jd_skills = skill_extractor.extract_skills(job_description)
+        jd_sbert = pre.clean_only(job_description)
+        jd_tfidf = pre.full(job_description)
+        job_embedding = sbert_matcher.embed(jd_sbert)
+
+        resume_embeddings, resume_names = [], []
+        resume_skills_list, tfidf_scores = [], []
+        resume_section_locations, resume_detected_sections = [], []
+
+        with st.spinner("⏳ Analysing resumes..."):
+            for file in uploaded_files:
+                raw_text = extract_pdf_text(file)
+                if not raw_text.strip():
+                    st.warning(f"⚠️ {file.name} has no readable text — skipped.")
+                    continue
+
+                sbert_text = pre.clean_only(raw_text)
+                embedding = sbert_matcher.embed(sbert_text)
+                tfidf_text = pre.full(raw_text)
+                tfidf_score = tfidf_matcher.similarity(jd_tfidf, tfidf_text)
+
+                skills = skill_extractor.extract_skills(raw_text)
+                sections = parse_sections(raw_text)
+                locations_raw = locate_skills_in_sections(skills, sections)
+                locations = {s: (locs[0] if locs else "") for s, locs in locations_raw.items()}
+
+                resume_embeddings.append(embedding)
+                resume_names.append(file.name)
+                resume_skills_list.append(skills)
+                tfidf_scores.append(tfidf_score)
+                resume_section_locations.append(locations)
+                resume_detected_sections.append(list(sections.keys()))
+
+        if not resume_embeddings:
+            st.error("No valid resumes could be processed.")
+        else:
+            ranking = rank_resumes(
+                job_embedding=job_embedding,
+                resume_embeddings=resume_embeddings,
+                resume_names=resume_names,
+                job_skills=jd_skills,
+                resume_skills_list=resume_skills_list,
+                tfidf_scores=tfidf_scores,
+            )
+
+            locations_map = dict(zip(resume_names, resume_section_locations))
+            sections_map = dict(zip(resume_names, resume_detected_sections))
+            tfidf_map = dict(zip(resume_names, tfidf_scores))
+
+            st.markdown("---")
+            st.markdown("## 📊 ATS Analysis Results")
+
+            total_jd_skills = len(jd_skills) if jd_skills else 1
+
+            if jd_skills:
+                st.markdown(
+                    f"**{len(jd_skills)} skills detected in JD:** "
+                    + " ".join(f"`{s}`" for s in jd_skills)
+                )
+            else:
+                st.warning("No specific skills detected in the JD. Add explicit skill names like Python, Docker, AWS.")
+
+            st.markdown(f"**{len(resume_embeddings)} resume(s) analysed.**")
+            st.divider()
+
+            # ── Leaderboard ──
+            st.markdown("### 🏆 Candidate Leaderboard")
+            leaderboard_rows, ats_results_map = [], {}
+
+            for i, row in ranking.iterrows():
+                name = row["Resume"]
+                sbert_score = float(row["SBERT Score"])
+                tfidf_score = tfidf_map.get(name, 0.0)
+                locations = locations_map.get(name, {})
+                sections = sections_map.get(name, [])
+
+                ats = compute_ats_score(
+                    jd_skills=jd_skills,
+                    resume_skills=resume_skills_list[resume_names.index(name)],
+                    sbert_score=sbert_score,
+                    tfidf_score=tfidf_score,
+                    skill_locations=locations,
+                    detected_sections=sections,
+                )
+                ats_results_map[name] = ats
+                grade, label, _ = ats_grade(ats["total"])
+
+                leaderboard_rows.append({
+                    "Rank": f"#{i}",
+                    "Resume": name,
+                    "ATS Score": f"{ats['total']}/100",
+                    "Grade": f"{grade} — {label}",
+                    "Skill Match": f"{ats['breakdown']['skill_match_pct']}%",
+                    "Matched": len(ats["breakdown"]["matched_skills"]),
+                    "Missing": len(ats["breakdown"]["missing_skills"]),
+                })
+
+            lb_df = pd.DataFrame(leaderboard_rows)
+            st.dataframe(lb_df, use_container_width=True, hide_index=True)
+            st.divider()
+
+            # ── Detailed cards ──
+            st.markdown("### 📋 Detailed Analysis")
+
+            for i, row in ranking.iterrows():
+                name = row["Resume"]
+                score = float(row["Final Score"])
+                locations = locations_map.get(name, {})
+                ats = ats_results_map[name]
+                grade, grade_label, _ = ats_grade(ats["total"])
+                matched = ats["breakdown"]["matched_skills"]
+                missing = ats["breakdown"]["missing_skills"]
+
+                interpretation = match_interpretation(score)
+                suggestions = improvement_suggestions(missing)
+                tips = section_tips(locations, matched)
+                report_text = generate_report(
+                    name, jd_skills, ats, score, matched, missing, locations, suggestions, tips
                 )
 
-            st.pyplot(fig, use_container_width=True)
-        else:
-            st.write("No skills detected to compare.")
+                with st.container(border=True):
+                    h1, h2, h3, h4 = st.columns([3, 1, 1, 1])
+                    with h1:
+                        st.markdown(f"### #{i} {name}")
+                        st.caption(interpretation)
+                    with h2:
+                        st.metric("ATS Score", f"{ats['total']}/100")
+                    with h3:
+                        st.metric("Grade", f"{grade} — {grade_label}")
+                    with h4:
+                        st.metric("Skill Coverage", f"{ats['breakdown']['skill_match_pct']}%")
 
-        skill_col1, skill_col2 = st.columns(2)
-        with skill_col1:
-            st.markdown("**✅ Matched Skills**")
-            st.write(", ".join(matched) if matched else "None")
-        with skill_col2:
-            st.markdown("**❌ Missing Skills**")
-            st.write(", ".join(missing) if missing else "None — great match!")
+                    st.markdown("**Score Breakdown:**")
+                    b1, b2, b3, b4, b5 = st.columns(5)
+                    b1.metric("Skill Match", f"{ats['skill_match']}/40", help="JD skills found in resume")
+                    b2.metric("Semantic", f"{ats['semantic_relevance']}/25", help="SBERT semantic similarity")
+                    b3.metric("Experience", f"{ats['experience_relevance']}/20", help="Skills found in Experience/Projects")
+                    b4.metric("Structure", f"{ats['resume_structure']}/10", help="Key sections present in resume")
+                    b5.metric("Keywords", f"{ats['keyword_coverage']}/5", help="TF-IDF keyword overlap")
 
-        st.divider()
+                    # Our enhancement: skill-gap chart, inside the matched/missing expander
+                    with st.expander("🔍 Skill Match Details", expanded=(i == 1)):
+                        render_skill_gap_chart(matched, missing)
+                        sk1, sk2 = st.columns(2)
+                        with sk1:
+                            st.markdown(f"**✅ Matched ({len(matched)}/{total_jd_skills})**")
+                            if matched:
+                                for skill in matched:
+                                    section = locations.get(skill, "")
+                                    st.success(f"{skill}  `{section}`" if section else skill)
+                            else:
+                                st.info("No JD skills matched.")
+                        with sk2:
+                            st.markdown(f"**❌ Missing ({len(missing)}/{total_jd_skills})**")
+                            if missing:
+                                for skill in missing:
+                                    st.error(skill)
+                            else:
+                                st.success("🎉 All required JD skills present!")
 
-        # ── Resume structure ──
-        st.subheader("📋 Resume Structure")
-        st.write(f"**Sections found:** {', '.join(breakdown['sections_found']) or 'None'}")
-        if breakdown["sections_missing"]:
-            st.write(f"**Sections missing:** {', '.join(breakdown['sections_missing'])}")
+                    with st.expander("💡 Resume Section Tips"):
+                        for tip in tips:
+                            st.markdown(tip)
+
+                    with st.expander("🚀 How to Improve This Resume"):
+                        if suggestions:
+                            st.markdown("Based on missing skills, here are specific steps:")
+                            for s in suggestions:
+                                st.markdown(f"• {s}")
+                        else:
+                            st.success("No missing skills — nothing to improve!")
+
+                    st.download_button(
+                        label="📥 Download Full ATS Report",
+                        data=report_text,
+                        file_name=f"ats_report_{name.replace('.pdf', '')}_{datetime.now().strftime('%Y%m%d')}.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                    )
