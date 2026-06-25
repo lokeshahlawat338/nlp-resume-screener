@@ -3,7 +3,7 @@ NLP Resume Screener — Streamlit UI.
 """
 
 import streamlit as st
-import pandas as pd
+import matplotlib.pyplot as plt
 
 from src.extractor import extract_pdf_text
 from src.preprocessing import TextPreprocessor
@@ -119,21 +119,42 @@ if analyze_clicked:
 
         st.divider()
 
-        # ── Matched / Missing skills ──
+        # ── Matched / Missing skills: visual chart + text ──
         breakdown = result["breakdown"]
+        matched = breakdown["matched_skills"]
+        missing = breakdown["missing_skills"]
+
+        st.subheader("📊 Skill Gap Analysis")
+
+        if matched or missing:
+            skill_labels = matched + missing
+            skill_colors = ["#2ecc71"] * len(matched) + ["#e74c3c"] * len(missing)
+            skill_values = [1] * len(skill_labels)  # uniform bar length; color is the signal
+
+            fig, ax = plt.subplots(figsize=(8, max(2, len(skill_labels) * 0.4)))
+            bars = ax.barh(skill_labels, skill_values, color=skill_colors)
+            ax.set_xlim(0, 1.3)
+            ax.set_xticks([])
+            ax.invert_yaxis()  # first skill at top
+            ax.spines[["top", "right", "bottom"]].set_visible(False)
+
+            for bar, label in zip(bars, ["Matched"] * len(matched) + ["Missing"] * len(missing)):
+                ax.text(
+                    bar.get_width() + 0.05, bar.get_y() + bar.get_height() / 2,
+                    label, va="center", fontsize=9, color="#555"
+                )
+
+            st.pyplot(fig, use_container_width=True)
+        else:
+            st.write("No skills detected to compare.")
+
         skill_col1, skill_col2 = st.columns(2)
         with skill_col1:
-            st.subheader("✅ Matched Skills")
-            if breakdown["matched_skills"]:
-                st.write(", ".join(breakdown["matched_skills"]))
-            else:
-                st.write("None")
+            st.markdown("**✅ Matched Skills**")
+            st.write(", ".join(matched) if matched else "None")
         with skill_col2:
-            st.subheader("❌ Missing Skills")
-            if breakdown["missing_skills"]:
-                st.write(", ".join(breakdown["missing_skills"]))
-            else:
-                st.write("None — great match!")
+            st.markdown("**❌ Missing Skills**")
+            st.write(", ".join(missing) if missing else "None — great match!")
 
         st.divider()
 
